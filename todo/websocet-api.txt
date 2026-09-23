@@ -1,0 +1,998 @@
+================================================================================
+                    WEBSOCKET API IMPLEMENTATION GUIDE
+                         Conductor Project v0.0.1
+================================================================================
+
+TABLE OF CONTENTS:
+1. Architecture Overview
+2. Setup & Dependencies
+3. Message Protocol
+4. WebSocket Endpoint Configuration
+5. Handler Implementation
+6. Message Types & Examples
+7. Client Implementation Guide
+8. Best Practices & Recommendations
+9. Error Handling
+10. Performance Considerations
+11. Testing Strategy
+
+================================================================================
+1. ARCHITECTURE OVERVIEW
+================================================================================
+
+The Conductor project implements a bidirectional WebSocket communication layer
+to enable real-time message exchange between:
+  - Central Conductor (server)
+  - Worker Instances (clients)
+  - CLI/Web Clients (optional)
+
+Communication Pattern:
+  - Protocol: WebSocket (RFC 6455)
+  - Message Format: JSON text messages
+  - Handler Pattern: Spring WebSocket Handler with session management
+  - Session Storage: ConcurrentHashMap for thread-safe worker registry
+
+Primary Components:
+  1. WebSocketConfig - Configures WebSocket handlers and endpoints
+  2. WorkerSocketHandler - Processes messages and manages connections
+  3. CommandMessage - Standardized message structure for all communications
+
+================================================================================
+2. SETUP & DEPENDENCIES
+================================================================================
+
+MAVEN DEPENDENCIES (pom.xml):
+  - spring-boot-starter-websocket (Spring Boot WebSocket support)
+  - spring-boot-starter (Core Spring Boot framework)
+  - jackson-databind (JSON serialization/deserialization)
+  - lombok (Optional: for model annotations like @Data)
+
+Required Version:
+  - Java 21+
+  - Spring Boot 4.0.6+
+  - Maven 3.6+
+
+Installation Steps:
+  1. Verify pom.xml contains:
+     <dependency>
+       <groupId>org.springframework.boot</groupId>
+       <artifactId>spring-boot-starter-websocket</artifactId>
+     </dependency>
+  
+  2. Run: mvn clean install
+  3. Verify compilation succeeds without errors
+
+================================================================================
+3. MESSAGE PROTOCOL
+================================================================================
+
+All WebSocket messages MUST follow the CommandMessage structure:
+
+CLASS: com.enoch.conductor.command.CommandMessage
+
+REQUIRED FIELDS:
+  - id (String): Unique request ID (UUID format)
+    Purpose: Correlate requests with responses, enable async handling
+    Example: "550e8400-e29b-41d4-a716-446655440000"
+  
+  - type (String): Message type/action
+    Format: "request:ACTION", "response:ACTION", or "error:ACTION"
+    Examples: "request:restart", "response:log", "error:command"
+  
+  - from (String): Message sender identifier
+    Format: "conductor", "workerid", "client#identifier"
+    Examples: "conductor", "worker#1", "kamil#Erth"
+  
+  - to (String): Message recipient
+    Format: "workerid", "conductor", "broadcast"
+    Examples: "worker#1", "broadcast"
+  
+  - timestamp (long): Unix timestamp in milliseconds
+    Purpose: Track message timing and ordering
+    Source: System.currentTimeMillis()
+
+OPTIONAL FIELDS:
+  - status (int): HTTP-like status code
+    Standard Codes:
+      100 = Pending/Processing
+      200 = OK/Success
+      201 = Created
+      204 = No Content
+      400 = Bad Request
+      401 = Unauthorized
+      403 = Forbidden
+      404 = Not Found
+      500 = Internal Server Error
+      503 = Service Unavailable
+  
+  - payload (Object): Command/response data
+    Type: Can be HashMap, String, List, or any serializable Object
+    Purpose: Carry actual command data or results
+  
+  - error (String): Error message if operation failed
+    Format: Descriptive error message
+    Example: "Worker instance not found or offline"
+  
+  - metadata (Map<String, String>): Additional information
+    Common Keys: "version", "environment", "executionTime", "errorCode"
+    Example: {"version": "1.0.0", "environment": "production"}
+
+================================================================================
+4. WEBSOCKET ENDPOINT CONFIGURATION
+================================================================================
+
+ENDPOINT: ws://localhost:8080/ws
+           wss://localhost:8443/ws (with SSL/TLS)
+
+CONFIG CLASS: com.enoch.conductor.ws.WebSocketConfig
+
+Current Configuration:
+  @Configuration
+  @EnableWebSocket
+  public class WebSocketConfig implements WebSocketConfigurer {
+      private final WorkerSocketHandler handler;
+      
+      public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+          registry.addHandler(handler, "/ws")
+                  .setAllowedOrigins("*");
+      }
+  }
+
+SECURITY RECOMMENDATIONS (To be implemented):
+  1. RESTRICT ALLOWED ORIGINS:
+     .setAllowedOrigins("localhost:3000", "localhost:4200", "yourdomain.com")
+     DO NOT use "*" in production
+  
+  2. ADD CORS CONFIGURATION:
+     Create CorsConfig with CrossOrigin annotation
+  
+  3. IMPLEMENT AUTHENTICATION:
+     Add HandshakeInterceptor to validate tokens before connection
+     Example:
+       registry.addHandler(handler, "/ws")
+               .addInterceptors(new HttpSessionHandshakeInterceptor())
+               .setAllowedOrigins("yourdomain.com");
+  
+  4. ENABLE RATE LIMITING:
+     Implement message rate limiting per client
+  
+  5. USE SECURE WEBSOCKET (WSS):
+     Configure SSL/TLS in application.properties:
+       server.ssl.key-store=classpath:keystore.p12
+       server.ssl.key-store-password=yourpassword
+
+================================================================================
+5. HANDLER IMPLEMENTATION
+================================================================================
+
+CLASS: com.enoch.conductor.ws.WorkerSocketHandler extends TextWebSocketHandler
+
+LIFECYCLE METHODS:
+
+afterConnectionEstablished(WebSocketSession session):
+  - Called when client establishes WebSocket connection
+  - Current: Logs connection (improve with proper logging)
+  - Should: Initialize session context, set attributes
+  - Example Enhancement:
+      String sessionId = UUID.randomUUID().toString();
+      session.getAttributes().put("connectionTime", System.currentTimeMillis());
+      session.getAttributes().put("sessionId", sessionId);
+      logger.info("Connection established: " + sessionId);
+
+handleTextMessage(WebSocketSession session, TextMessage message):
+  - Called when text message arrives
+  - Current: Parses JSON, handles REGISTER and LOG types
+  - Must: Deserialize CommandMessage, route to handlers
+  - Should Handle ALL message types (not just REGISTER/LOG)
+
+afterConnectionClosed(WebSocketSession session, CloseStatus status):
+  - Called when connection is closed
+  - Current: Removes session from worker registry (has bug)
+  - Must: Clean up resources, log disconnection
+  - Bug Fix: Use workers.entrySet().removeIf() instead of values().remove()
+
+SESSION REGISTRY MANAGEMENT:
+  - Storage: ConcurrentHashMap<String, WebSocketSession> workers
+  - Thread-Safe: Yes (ConcurrentHashMap)
+  - Access Pattern: workers.put(workerId, session) for registration
+  - Cleanup: Must remove on disconnect
+  - Scalability Issue: Consider distributed cache (Redis) for multi-instance
+
+HANDLER METHOD STRUCTURE:
+  public void send(String workerId, String json) throws Exception {
+      WebSocketSession session = workers.get(workerId);
+      if (session == null) {
+          logger.warn("Worker not found: " + workerId);
+          return;
+      }
+      session.sendMessage(new TextMessage(json));
+  }
+  
+  public void broadcast(String json) throws Exception {
+      for (WebSocketSession session : workers.values()) {
+          session.sendMessage(new TextMessage(json));
+      }
+  }
+
+================================================================================
+6. MESSAGE TYPES & EXAMPLES
+================================================================================
+
+TYPE: REGISTER (Worker Registration)
+Purpose: Worker instance registers with conductor
+Flow:
+  1. Worker connects to WebSocket endpoint
+  2. Worker sends REGISTER message with instanceId
+  3. Conductor stores session mapping (instanceId -> WebSocketSession)
+  4. Conductor sends confirmation or ACK
+
+Request Message:
+{
+  "id": "550e8400-e29b-41d4-a716-446655440001",
+  "type": "request:register",
+  "from": "worker#1",
+  "to": "conductor",
+  "timestamp": 1694000000000,
+  "status": 100,
+  "payload": {
+    "instanceId": "worker#1",
+    "hostname": "machine-name",
+    "version": "1.0.0"
+  }
+}
+
+Response Message:
+{
+  "id": "550e8400-e29b-41d4-a716-446655440001",
+  "type": "response:register",
+  "from": "conductor",
+  "to": "worker#1",
+  "timestamp": 1694000000001,
+  "status": 200,
+  "payload": {
+    "registered": true,
+    "sessionId": "session-xyz"
+  }
+}
+
+---
+
+TYPE: LOG (Worker Logging)
+Purpose: Worker sends log messages to conductor
+Flow:
+  1. Worker performs operation
+  2. Worker sends LOG message with log data
+  3. Conductor receives and stores/displays log
+  4. No response typically required
+
+Message:
+{
+  "id": "550e8400-e29b-41d4-a716-446655440002",
+  "type": "request:log",
+  "from": "worker#1",
+  "to": "conductor",
+  "timestamp": 1694000000002,
+  "payload": {
+    "level": "INFO",
+    "message": "Process started successfully",
+    "context": "ProcessService.start()"
+  },
+  "metadata": {
+    "environment": "production"
+  }
+}
+
+---
+
+TYPE: COMMAND (Execute Command on Worker)
+Purpose: Conductor sends command to worker for execution
+Flow:
+  1. Conductor prepares command
+  2. Conductor sends to specific worker
+  3. Worker receives and processes command
+  4. Worker sends response with result
+
+Request (Conductor -> Worker):
+{
+  "id": "550e8400-e29b-41d4-a716-446655440003",
+  "type": "request:execute",
+  "from": "conductor",
+  "to": "worker#1",
+  "timestamp": 1694000000003,
+  "status": 100,
+  "payload": {
+    "command": "restart",
+    "instanceId": "myprocess#1",
+    "force": false
+  }
+}
+
+Response (Worker -> Conductor):
+{
+  "id": "550e8400-e29b-41d4-a716-446655440003",
+  "type": "response:execute",
+  "from": "worker#1",
+  "to": "conductor",
+  "timestamp": 1694000000010,
+  "status": 200,
+  "payload": {
+    "success": true,
+    "result": "Process restarted",
+    "pid": 12345
+  }
+}
+
+---
+
+TYPE: ERROR (Error Notification)
+Purpose: Notify about processing errors
+Flow:
+  1. Error occurs during processing
+  2. Sender creates error response
+  3. Sends with status 4xx/5xx and error field populated
+
+Error Message:
+{
+  "id": "550e8400-e29b-41d4-a716-446655440004",
+  "type": "error:execute",
+  "from": "worker#1",
+  "to": "conductor",
+  "timestamp": 1694000000005,
+  "status": 500,
+  "error": "Failed to restart process: Port already in use",
+  "payload": {
+    "errorCode": "PORT_IN_USE",
+    "failedCommand": "restart"
+  },
+  "metadata": {
+    "errorType": "IOException",
+    "port": "8080"
+  }
+}
+
+---
+
+TYPE: HEARTBEAT (Connection Keep-Alive)
+Purpose: Detect stale connections, prevent timeout
+Flow:
+  1. Conductor sends heartbeat message every 30 seconds
+  2. Worker receives and sends response
+  3. No response = connection dead (timeout)
+
+Message:
+{
+  "id": "550e8400-e29b-41d4-a716-446655440005",
+  "type": "request:heartbeat",
+  "from": "conductor",
+  "to": "worker#1",
+  "timestamp": 1694000000006
+}
+
+Response:
+{
+  "id": "550e8400-e29b-41d4-a716-446655440005",
+  "type": "response:heartbeat",
+  "from": "worker#1",
+  "to": "conductor",
+  "timestamp": 1694000000007,
+  "status": 200
+}
+
+================================================================================
+7. CLIENT IMPLEMENTATION GUIDE (For New Clients)
+================================================================================
+
+JAVASCRIPT/WEB CLIENT EXAMPLE:
+
+class ConductorWebSocketClient {
+  constructor(url = 'ws://localhost:8080/ws') {
+    this.url = url;
+    this.socket = null;
+    this.messageHandlers = {};
+    this.messageQueue = [];
+    this.isConnected = false;
+  }
+
+  connect() {
+    return new Promise((resolve, reject) => {
+      try {
+        this.socket = new WebSocket(this.url);
+        
+        this.socket.onopen = () => {
+          this.isConnected = true;
+          console.log('WebSocket connected');
+          this.flushMessageQueue();
+          resolve();
+        };
+        
+        this.socket.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            this.handleMessage(message);
+          } catch (e) {
+            console.error('Failed to parse message:', e);
+          }
+        };
+        
+        this.socket.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          reject(error);
+        };
+        
+        this.socket.onclose = () => {
+          this.isConnected = false;
+          console.log('WebSocket disconnected');
+          this.attemptReconnect();
+        };
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  sendMessage(message) {
+    if (!this.isConnected) {
+      this.messageQueue.push(message);
+      return Promise.reject('Not connected');
+    }
+    
+    return new Promise((resolve, reject) => {
+      try {
+        const json = JSON.stringify(message);
+        this.socket.send(json);
+        resolve();
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  handleMessage(message) {
+    const { id, type, from } = message;
+    if (this.messageHandlers[type]) {
+      this.messageHandlers[type](message);
+    }
+  }
+
+  on(messageType, handler) {
+    this.messageHandlers[messageType] = handler;
+  }
+
+  flushMessageQueue() {
+    while (this.messageQueue.length > 0) {
+      const message = this.messageQueue.shift();
+      this.sendMessage(message).catch(err => {
+        this.messageQueue.unshift(message);
+      });
+    }
+  }
+
+  attemptReconnect(maxAttempts = 5) {
+    // Implement exponential backoff reconnection logic
+  }
+
+  disconnect() {
+    if (this.socket) {
+      this.socket.close();
+    }
+  }
+}
+
+USAGE EXAMPLE:
+  const client = new ConductorWebSocketClient();
+  
+  client.on('response:execute', (message) => {
+    console.log('Command executed:', message.payload);
+  });
+  
+  await client.connect();
+  
+  await client.sendMessage({
+    id: generateUUID(),
+    type: 'request:execute',
+    from: 'web-client',
+    to: 'conductor',
+    timestamp: Date.now(),
+    payload: {
+      command: 'restart',
+      instanceId: 'myprocess'
+    }
+  });
+
+PYTHON CLIENT EXAMPLE (using websocket-client library):
+
+import json
+import asyncio
+import websockets
+from uuid import uuid4
+
+class ConductorWebSocketClient:
+    def __init__(self, url='ws://localhost:8080/ws'):
+        self.url = url
+        self.websocket = None
+        self.message_handlers = {}
+
+    async def connect(self):
+        self.websocket = await websockets.connect(self.url)
+        print('Connected to Conductor')
+        asyncio.create_task(self.receive_messages())
+
+    async def receive_messages(self):
+        while True:
+            try:
+                message_json = await self.websocket.recv()
+                message = json.loads(message_json)
+                await self.handle_message(message)
+            except Exception as e:
+                print(f'Error receiving message: {e}')
+                break
+
+    async def send_message(self, message):
+        json_str = json.dumps(message)
+        await self.websocket.send(json_str)
+
+    async def handle_message(self, message):
+        msg_type = message.get('type')
+        if msg_type in self.message_handlers:
+            await self.message_handlers[msg_type](message)
+
+    def on(self, message_type, handler):
+        self.message_handlers[message_type] = handler
+
+    async def disconnect(self):
+        if self.websocket:
+            await self.websocket.close()
+
+USAGE:
+  async def main():
+    client = ConductorWebSocketClient()
+    await client.connect()
+    
+    async def handle_response(msg):
+        print(f'Received: {msg}')
+    
+    client.on('response:execute', handle_response)
+    
+    await client.send_message({
+        'id': str(uuid4()),
+        'type': 'request:register',
+        'from': 'python-worker',
+        'to': 'conductor',
+        'timestamp': int(time.time() * 1000),
+        'payload': {'instanceId': 'python-worker-1'}
+    })
+    
+    await asyncio.sleep(10)
+    await client.disconnect()
+
+================================================================================
+8. BEST PRACTICES & RECOMMENDATIONS
+================================================================================
+
+1. MESSAGE ID GENERATION:
+   - Always generate unique UUIDs for message IDs
+   - Use java.util.UUID.randomUUID() on Java side
+   - Use uuid library on Python/JavaScript side
+   - Enable request-response correlation via same ID
+
+2. TIMESTAMP MANAGEMENT:
+   - Always include timestamp in every message
+   - Use System.currentTimeMillis() for consistency
+   - Enables message ordering and timeout detection
+   - Validate timestamp difference on receiver (detect clock skew)
+
+3. MESSAGE ROUTING:
+   - Use specific worker IDs for directed messages (to: "worker#1")
+   - Use "broadcast" only for system-wide messages
+   - Avoid broadcasting frequently (use selective routing)
+   - Implement topic-based subscriptions for scalability
+
+4. ERROR HANDLING:
+   - ALWAYS include error field in error responses
+   - Set appropriate HTTP-like status code
+   - Include errorCode in metadata for programmatic handling
+   - Log full stack trace on server (not in payload)
+
+5. CONNECTION MANAGEMENT:
+   - Implement heartbeat/ping-pong every 30 seconds
+   - Set connection timeout to 60 seconds
+   - Gracefully handle reconnection with exponential backoff
+   - Store connection state with creation timestamp
+   - Implement connection pooling for high throughput
+
+6. SECURITY:
+   - Validate all incoming messages for required fields
+   - Implement message signing using HMAC-SHA256
+   - Validate sender identity before processing
+   - Implement per-message encryption for sensitive data
+   - Use TLS/SSL (wss://) in production
+   - Implement rate limiting per client (max X messages/sec)
+
+7. LOGGING & MONITORING:
+   - Log all connections: time, client info, session ID
+   - Log all disconnections: reason, duration
+   - Log message errors with full context
+   - Monitor queue sizes and latency
+   - Track message throughput and error rates
+
+8. PERFORMANCE:
+   - Use message batching for high-volume operations
+   - Implement backpressure handling (queue full scenarios)
+   - Set maximum message size limits
+   - Use compression for large payloads
+   - Implement connection pooling and reuse
+
+9. STATE MANAGEMENT:
+   - Store worker state in session attributes
+   - Don't store mutable state in handler class (thread-safe concerns)
+   - Use ConcurrentHashMap for all shared state
+   - Implement graceful state cleanup on disconnect
+
+10. TESTING:
+    - Unit test message serialization/deserialization
+    - Integration test with MockWebSocketSession
+    - Load test with multiple concurrent connections
+    - Test reconnection scenarios and timeout handling
+    - Test message ordering and durability
+
+================================================================================
+9. ERROR HANDLING
+================================================================================
+
+ERROR SCENARIOS & RESPONSES:
+
+1. INVALID MESSAGE FORMAT:
+   Issue: Message not valid JSON or missing required fields
+   Response Status: 400
+   Response:
+   {
+     "type": "error:parse",
+     "status": 400,
+     "error": "Invalid message format: missing field 'id'",
+     "metadata": {"errorCode": "INVALID_FORMAT"}
+   }
+
+2. WORKER NOT FOUND:
+   Issue: Conductor tries to send message to non-existent worker
+   Response Status: 404
+   Response:
+   {
+     "id": "original-request-id",
+     "type": "error:routing",
+     "status": 404,
+     "error": "Worker instance not found or offline: worker#99",
+     "metadata": {"errorCode": "WORKER_NOT_FOUND"}
+   }
+
+3. AUTHENTICATION FAILED:
+   Issue: Client tries to connect without valid credentials
+   Response Status: 401
+   Response:
+   {
+     "type": "error:auth",
+     "status": 401,
+     "error": "Authentication failed: Invalid token",
+     "metadata": {"errorCode": "UNAUTHORIZED"}
+   }
+
+4. RATE LIMIT EXCEEDED:
+   Issue: Client sends too many messages
+   Response Status: 429
+   Response:
+   {
+     "id": "request-id",
+     "type": "error:rate_limit",
+     "status": 429,
+     "error": "Rate limit exceeded: maximum 100 messages per minute",
+     "metadata": {"errorCode": "RATE_LIMIT_EXCEEDED", "retryAfter": "30"}
+   }
+
+5. COMMAND EXECUTION FAILED:
+   Issue: Worker fails to execute command
+   Response Status: 500
+   Response:
+   {
+     "id": "original-request-id",
+     "type": "error:execute",
+     "from": "worker#1",
+     "to": "conductor",
+     "status": 500,
+     "error": "Failed to start process: Java process exited unexpectedly",
+     "payload": {
+       "exitCode": 1,
+       "stderr": "ClassNotFoundException: com.example.Main"
+     }
+   }
+
+ERROR HANDLING BEST PRACTICES:
+
+1. ALWAYS RETURN ERROR RESPONSES:
+   - Don't silently fail or ignore messages
+   - Return response with appropriate status code
+   - Include descriptive error message
+   - Include machine-readable errorCode
+
+2. IMPLEMENT RETRY LOGIC:
+   - Retry transient errors (5xx, timeouts)
+   - Don't retry permanent errors (4xx)
+   - Use exponential backoff (wait 1s, 2s, 4s, etc.)
+   - Max 3-5 retries before giving up
+
+3. TIMEOUT HANDLING:
+   - Set timeout of 30 seconds for request-response pairs
+   - Track pending requests by ID
+   - Remove stale requests after timeout
+   - Send timeout error to client
+
+4. LOG ERRORS PROPERLY:
+   - Log error with full context (message, sender, receiver)
+   - Include stack trace on server logs (not in response)
+   - Use structured logging (JSON format)
+   - Include request ID for correlation
+
+================================================================================
+10. PERFORMANCE CONSIDERATIONS
+================================================================================
+
+SCALABILITY ISSUES TO ADDRESS:
+
+1. SINGLE SERVER LIMITATION:
+   Current: ConcurrentHashMap stores sessions on single JVM
+   Problem: Cannot scale to multiple Conductor instances
+   Solution: Use distributed cache (Redis) for session storage
+   
+   Implementation:
+   - Replace workers ConcurrentHashMap with RedisTemplate
+   - Store sessions with expiration (TTL)
+   - Use pub/sub for cross-instance messaging
+   
+   Redis Config:
+   ```
+   @Configuration
+   public class RedisWebSocketConfig {
+       @Bean
+       public RedisTemplate<String, WebSocketSession> sessionTemplate() {
+           // Configure Redis template
+       }
+   }
+   ```
+
+2. MESSAGE THROUGHPUT:
+   Current: Sequential message processing
+   Problem: Blocking calls can slow message handling
+   Solution: Use message queues (RabbitMQ, Kafka)
+   
+   Benefits:
+   - Decouple sender from receiver
+   - Enable reliable message delivery
+   - Support message ordering
+   - Enable replay capability
+
+3. MEMORY USAGE:
+   Current: All sessions in memory
+   Problem: Memory grows with worker count
+   Solution: Implement session eviction policy
+   
+   Implementation:
+   - Set TTL on worker registry entries
+   - Require heartbeat to keep session alive
+   - Remove sessions on disconnect immediately
+   - Monitor memory usage and connection count
+
+4. CONNECTION POOLING:
+   Recommendation: Use connection pooling for client connections
+   - Pool size: CPU cores * 2
+   - Keep-alive time: 5 minutes
+   - Idle timeout: 1 minute
+
+5. MESSAGE BATCHING:
+   Recommendation: Batch messages when possible
+   - Max batch size: 100 messages
+   - Max wait time: 100ms
+   - Reduces overhead for high-volume operations
+
+6. THREAD POOL CONFIGURATION:
+   Add to application.properties:
+   ```
+   spring.task.execution.pool.core-size=10
+   spring.task.execution.pool.max-size=50
+   spring.task.execution.pool.queue-capacity=500
+   spring.task.scheduling.pool.size=5
+   ```
+
+7. COMPRESSION:
+   Enable compression for large payloads:
+   ```
+   server.compression.enabled=true
+   server.compression.min-response-size=1024
+   server.compression.mime-types=application/json,text/plain
+   ```
+
+================================================================================
+11. TESTING STRATEGY
+================================================================================
+
+UNIT TESTING:
+
+1. CommandMessage Serialization:
+   ```java
+   @Test
+   public void testCommandMessageSerialization() {
+       CommandMessage msg = new CommandMessage();
+       msg.setId(UUID.randomUUID().toString());
+       msg.setType("request:test");
+       msg.setFrom("test-client");
+       msg.setTo("conductor");
+       msg.setTimestamp(System.currentTimeMillis());
+       
+       ObjectMapper mapper = new ObjectMapper();
+       String json = mapper.writeValueAsString(msg);
+       CommandMessage deserialized = mapper.readValue(json, CommandMessage.class);
+       
+       assertEquals(msg.getId(), deserialized.getId());
+   }
+   ```
+
+2. Handler Message Processing:
+   ```java
+   @Test
+   public void testHandleTextMessage() throws Exception {
+       WorkerSocketHandler handler = new WorkerSocketHandler();
+       WebSocketSession session = mock(WebSocketSession.class);
+       TextMessage message = new TextMessage("{\"type\":\"REGISTER\",\"instanceId\":\"worker#1\"}");
+       
+       handler.handleTextMessage(session, message);
+       // Verify worker was registered
+   }
+   ```
+
+INTEGRATION TESTING:
+
+1. Full WebSocket Connection:
+   ```java
+   @Test
+   public void testWebSocketConnection() throws Exception {
+       WebSocketTestClient client = new WebSocketTestClient("ws://localhost:8080/ws");
+       client.connect();
+       
+       CommandMessage registerMsg = new CommandMessage();
+       registerMsg.setId(UUID.randomUUID().toString());
+       registerMsg.setType("request:register");
+       registerMsg.setFrom("test-worker");
+       registerMsg.setTo("conductor");
+       registerMsg.setTimestamp(System.currentTimeMillis());
+       registerMsg.setPayload(Map.of("instanceId", "test-worker"));
+       
+       client.send(registerMsg);
+       
+       CommandMessage response = client.receive(5, TimeUnit.SECONDS);
+       assertEquals("response:register", response.getType());
+       assertEquals(200, response.getStatus());
+       
+       client.disconnect();
+   }
+   ```
+
+LOAD TESTING:
+
+Use JMeter or Gatling to simulate high message volume:
+```
+- Ramp-up: 100 connections over 10 seconds
+- Duration: 5 minutes
+- Message frequency: 10 messages/second per connection
+- Verify: No message loss, latency < 100ms, error rate < 0.1%
+```
+
+================================================================================
+IMPLEMENTATION CHECKLIST FOR COPILOT
+================================================================================
+
+When adding WebSocket support to a new project, implement in this order:
+
+[ ] 1. DEPENDENCIES
+    - Add spring-boot-starter-websocket to pom.xml
+    - Add jackson-databind for JSON processing
+    - Run: mvn clean install
+
+[ ] 2. MESSAGE MODEL
+    - Create CommandMessage class with all fields
+    - Add @Data annotation (Lombok)
+    - Implement equals() and hashCode()
+    - Create factory methods for common message types
+
+[ ] 3. WEBSOCKET CONFIGURATION
+    - Create WebSocketConfig class
+    - Implement WebSocketConfigurer interface
+    - Register handler with endpoint /ws
+    - Add security configurations (CORS, authentication)
+
+[ ] 4. WEBSOCKET HANDLER
+    - Create WorkerSocketHandler extending TextWebSocketHandler
+    - Implement afterConnectionEstablished()
+    - Implement handleTextMessage()
+    - Implement afterConnectionClosed()
+    - Implement send() and broadcast() methods
+
+[ ] 5. MESSAGE ROUTING
+    - Create message router/dispatcher service
+    - Route messages by type to appropriate handlers
+    - Implement request-response correlation
+    - Add message validation
+
+[ ] 6. ERROR HANDLING
+    - Implement exception handling in handler
+    - Create standard error response format
+    - Add logging for all errors
+    - Implement graceful failure modes
+
+[ ] 7. TESTING
+    - Unit test message serialization
+    - Unit test handler methods with mocks
+    - Integration test with test client
+    - Load test with concurrent connections
+
+[ ] 8. DOCUMENTATION
+    - Document all message types
+    - Provide client examples (JavaScript, Python)
+    - Document configuration options
+    - Add troubleshooting guide
+
+[ ] 9. SECURITY HARDENING
+    - Implement authentication/authorization
+    - Add rate limiting
+    - Enable SSL/TLS (wss://)
+    - Validate all inputs
+
+[ ] 10. DEPLOYMENT & MONITORING
+    - Add health check endpoint
+    - Implement connection metrics
+    - Add performance monitoring
+    - Configure logging levels
+
+================================================================================
+TROUBLESHOOTING GUIDE
+================================================================================
+
+ISSUE: "Connection refused" or "Failed to connect"
+  Solution:
+  - Verify WebSocket endpoint is running: curl -i http://localhost:8080/ws
+  - Check firewall/port access: netstat -an | grep 8080
+  - Verify WebSocketConfig is loaded: Add debug logging
+  - Check application.properties for server.port configuration
+
+ISSUE: "Message parsing error" or "Invalid JSON"
+  Solution:
+  - Verify all required fields are present in JSON
+  - Check JSON syntax: Use JSONLint.com
+  - Enable debug logging: logging.level.com.enoch.conductor.ws=DEBUG
+  - Check character encoding (must be UTF-8)
+
+ISSUE: "Worker not found" error
+  Solution:
+  - Ensure worker sends REGISTER message first
+  - Check worker ID format matches exactly
+  - Verify worker connection is not closed
+  - Check logs for disconnection messages
+
+ISSUE: "Connection timeout" or "Message not received"
+  Solution:
+  - Check network connectivity: ping hostname
+  - Verify firewall allows WebSocket (wss default port 443)
+  - Check message queue size: May be full
+  - Monitor server resources: CPU, memory, connections
+
+ISSUE: "High memory usage"
+  Solution:
+  - Check for connection leaks: Monitor active connections
+  - Implement session timeout: Remove inactive sessions
+  - Monitor handler.workers map size
+  - Enable garbage collection tuning: -XX:+UseG1GC
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+
+Version: 1.0
+Last Updated: 2024
+Repository: inkwizytor89/conductor
+Contact: Use project issues for support

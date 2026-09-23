@@ -1,0 +1,16 @@
+spring:
+  main:
+    banner-mode: "off"
+    log-startup-info: false
+
+worker:
+  instance-id: ${INSTANCE_ID:worker-unknown}
+  instance-dir: ${INSTANCE_DIR:./instance}
+  manager-url: ${MANAGER_URL:ws://localhost:8080/ws}
+
+logging:
+  level:
+    root: OFF
+    com.enoch.worker: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level --- [%thread] %logger{36} - %msg%n"
